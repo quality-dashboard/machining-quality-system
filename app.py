@@ -40,6 +40,12 @@ app.py - 机加工质量检测系统（主程序）v3.5
         删除旧示例文字, 初始值为空; ④批量导入改为单请求pipeline一次性写入+
         空值清洗(防空单元格/空格导致HTTP 400); ⑤导入兼容重复列名(日期.1/班次.1);
         ⑥云端已删记录提示"记录已不存在"而非"删除失败"
+  缺陷类型调整(部署前): ①缺陷类型输入框改为数字输入框, 只允许非负整数(与GP12同步);
+        ②"过车/欠车"拆分为"过车"+"欠车"两个独立字段(历史过车欠车列保留不迁移,
+        移出统计); ③移除"滚道对称点过大"(与对称度超差重复, 历史列保留不统计);
+        ④"幅高椭圆"界面显示改为"平行度超差"(数据库列名不变, 历史数据自动继承);
+        ⑤录入页缺陷输入框key改为字段名(防列表增删后串值); ⑥导入时忽略旧"过车/欠车"列;
+        ⑦共12类缺陷, 表单/列表/图表/月报/总报告明细统一使用同一常量
 """
 import streamlit as st
 import pandas as pd
@@ -74,6 +80,7 @@ from data_utils import (
     get_alerts_from_data,
     export_report_to_excel,
     DEFECT_TYPE_FIELDS,
+    DEFECT_FIELDS_DISPLAY,
     aggregate_model_pass_rate,
     aggregate_defect_summary,
     aggregate_top5_alerts,
@@ -200,16 +207,23 @@ def _get_sidebar_stats():
 
 
 # 6个标准缺陷字段 (带斜杠, 与load_all_records返回一致)
-_DEFECT_DISPLAY_FIELDS = ["锻造缺陷", "磕伤/卡伤", "接刀痕", "过车/欠车", "油沟", "倒角"]
+# ★ 展示层回填用字段: 与统一的12类显示名保持一致(过车/欠车已拆分)
+_DEFECT_DISPLAY_FIELDS = list(DEFECT_FIELDS_DISPLAY)
 
-# 关键词匹配规则 (顺序: 过车>磕伤>接刀痕>倒角>油沟>锻造, 多匹配归第一个)
+# 关键词匹配规则 (顺序: 过车>欠车>磕伤>接刀痕>倒角>油沟>锻造, 多匹配归第一个)
+# ★ "过车/欠车"已拆分为两个独立缺陷类型, 分别匹配(漏黑在下方单独判断)
 _DEFECT_KEYWORD_RULES = [
-    ("过车/欠车", ["过车", "欠车"]),
+    ("过车", ["过车"]),
+    ("欠车", ["欠车"]),
     ("磕伤/卡伤", ["磕伤", "卡伤"]),
     ("接刀痕", ["接刀痕", "接刀"]),
     ("倒角", ["倒角"]),
     ("油沟", ["油沟"]),
     ("锻造缺陷", ["锻造", "锻件", "锻打"]),
+    ("椭圆超差", ["椭圆"]),
+    ("内径垫伤", ["垫伤"]),
+    ("对称度超差", ["对称度"]),
+    ("平行度超差", ["平行度"]),
 ]
 
 
@@ -361,6 +375,11 @@ def render_data_entry():
                 df_upload = _dedupe_upload_columns(df_upload)
                 df_upload = df_upload.fillna("")
 
+                # ★ 旧表头"过车/欠车"已废弃(拆分为"过车"+"欠车"): 提示改用分列导入
+                if ("过车/欠车" in df_upload.columns) or ("过车欠车" in df_upload.columns):
+                    st.warning("⚠️ 检测到旧列「过车/欠车」：该列将被忽略（不再计入缺陷统计）。"
+                               "请改用「过车」「欠车」两列分别填写数量。")
+
                 st.write("**预览（前5行）：**")
                 st.dataframe(df_upload.head(), use_container_width=True)
 
@@ -384,10 +403,15 @@ def render_data_entry():
                         "报废原因": "报废原因",
                         "返修原因": "返修原因",
                         "磕伤/卡伤": "磕伤卡伤",
-                        "过车/欠车": "过车欠车",
+                        "过车": "过车", "欠车": "欠车",
+                        "平行度超差": "幅高椭圆", "幅高椭圆": "幅高椭圆",
                     }
 
                     df_upload = df_upload.rename(columns=col_map)
+
+                    # ★ 旧表头"过车/欠车"已废弃(已拆分为"过车"+"欠车"): 忽略该列
+                    #   (不参与入库与统计; 页面已在上方提示用户改用分列导入)
+                    df_upload = df_upload.drop(columns=["过车/欠车", "过车欠车"], errors="ignore")
 
                     # ★ 工序锁定为"机加工": 无论Excel里工序列填什么, 统一写入"机加工"
                     #   (Excel没有工序列时此处会自动创建该列, 导入不再因缺工序列报错)
@@ -503,22 +527,26 @@ def render_data_entry():
 
     st.markdown("---")
 
-    st.subheader("⚠️ 缺陷类型（手动填写）")
-    st.caption("请依次填写具体缺陷描述（如\"锻造折叠\"、\"磕伤卡伤\"等），无则留空")
-
-    DEFECT_LABELS = {name: name for name in DEFECT_TYPE_FIELDS}
+    st.subheader("⚠️ 缺陷类型（填写数量）")
+    st.caption("每个缺陷类型只填数字（非负整数，如 0、1、2...），无缺陷填 0 或留空；全合格时自动留空")
 
     defect_inputs = {}
     dcols = st.columns(3)
-    for i in range(len(DEFECT_TYPE_FIELDS)):
-        field_name = DEFECT_TYPE_FIELDS[i]
-        label = DEFECT_LABELS[field_name]
+    # ★ 遍历统一的12类"界面显示名"(过车/欠车已拆分, 幅高椭圆显示为"平行度超差")
+    for i in range(len(DEFECT_FIELDS_DISPLAY)):
+        field_name = DEFECT_FIELDS_DISPLAY[i]
         col_idx = i % 3
         with dcols[col_idx]:
-            defect_inputs[field_name] = st.text_input(
-                label,
-                placeholder="填写{}描述...".format(label) if not all_pass else "",
-                key="entry_defect_{}".format(i + 1),
+            # ★ 数字输入框: 只允许非负整数(字母/中文/符号/负数被输入框与min_value双重拦截)
+            # ★ key用字段名而非序号: 缺陷列表增删后, 位置键会让在线会话的输入框串到别的字段的旧值
+            defect_inputs[field_name] = st.number_input(
+                field_name,
+                min_value=0,
+                max_value=999999,
+                value=0,
+                step=1,
+                format="%d",
+                key="entry_defect_{}".format(field_name),
                 disabled=all_pass,
             )
 
@@ -570,8 +598,10 @@ def render_data_entry():
             "返修原因": rework_reason.strip(),
         }
 
-        for field in DEFECT_TYPE_FIELDS:
-            new_record[field] = "" if all_pass else defect_inputs[field].strip()
+        for field in DEFECT_FIELDS_DISPLAY:
+            # ★ 缺陷类型存非负整数计数; 计数为0或全合格时存空串(与"空=无缺陷"统计口径一致)
+            _cnt = int(defect_inputs.get(field, 0) or 0)
+            new_record[field] = "" if (all_pass or _cnt <= 0) else str(_cnt)
 
         success = save_record(new_record)
         if success:
@@ -883,8 +913,8 @@ def render_analysis_report():
         trend_models = ["全部"] + sorted(df["型号"].dropna().unique().tolist())
         trend_model_sel = st.selectbox("型号选择", trend_models, key="mt_model")
     with mc3:
-        trend_defects = ["全部", "锻造缺陷", "磕伤/卡伤", "接刀痕", "过车/欠车", "油沟", "倒角", "漏黑",
-                         "椭圆超差", "内径垫伤", "滚道对称点过大", "对称度超差", "幅高椭圆"]
+        # ★ 缺陷类型下拉直接用统一的12类显示名(不再硬编码, 避免与常量不一致)
+        trend_defects = ["全部"] + list(DEFECT_FIELDS_DISPLAY)
         trend_defect_sel = st.selectbox("缺陷类型选择", trend_defects, key="mt_defect")
 
     # ★ 图4用完整df + 独立months参数 (不依赖顶部日期筛选)
@@ -923,14 +953,13 @@ def render_analysis_report():
     df_display = _backfill_defects_for_display(df_rpt)
 
     # ★ 任务B3: 列名与数据录入页对齐 (使用带斜杠的显示名 + 漏黑列 + 5个新缺陷字段)
-    display_cols = [
-        "日期", "班次", "型号", "产品类型", "订单号", "车削操作者",
-        "工序", "检测数量", "合格数量", "返修数量", "报废数量",
-        "报废率", "返修率", "总不合格率",
-        "锻造缺陷", "磕伤/卡伤", "接刀痕", "过车/欠车", "油沟", "倒角", "漏黑",
-        "椭圆超差", "内径垫伤", "滚道对称点过大", "对称度超差", "幅高椭圆",
-        "报废原因", "返修原因",
-    ]
+    display_cols = (
+        ["日期", "班次", "型号", "产品类型", "订单号", "车削操作者",
+         "工序", "检测数量", "合格数量", "返修数量", "报废数量",
+         "报废率", "返修率", "总不合格率"]
+        + list(DEFECT_FIELDS_DISPLAY)   # ★ 统一的12类缺陷(过车/欠车拆分, 平行度超差)
+        + ["报废原因", "返修原因"]
+    )
 
     existing = [c for c in display_cols if c in df_display.columns]
 

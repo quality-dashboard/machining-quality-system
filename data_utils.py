@@ -52,19 +52,32 @@ BASE_COLUMNS = [
 ]
 
 # 注意: 数据库列名不带斜杠, 避免 Turso SQL 解析器报 400
-# 7个原字段 + 5个新增字段(椭圆超差/内径垫伤/滚道对称点过大/对称度超差/幅高椭圆)
-DEFECT_COLUMNS = ["锻造缺陷", "磕伤卡伤", "接刀痕", "过车欠车", "油沟", "倒角", "漏黑",
-                  "椭圆超差", "内径垫伤", "滚道对称点过大", "对称度超差", "幅高椭圆"]
+# ★ 激活缺陷类型(12类, 这里是数据库列名, 不带斜杠避免Turso SQL解析400)
+#   - "过车欠车"已拆分为"过车"+"欠车"两个独立字段
+#   - "滚道对称点过大"已移除(与"对称度超差"语义重复)
+#   - "幅高椭圆"数据库列名保持不变(历史数据保留), 界面统一显示为"平行度超差"
+DEFECT_COLUMNS = ["锻造缺陷", "磕伤卡伤", "接刀痕", "过车", "欠车", "油沟", "倒角", "漏黑",
+                  "椭圆超差", "内径垫伤", "对称度超差", "幅高椭圆"]
+
+# ★ 历史遗留缺陷列: 仅保留数据库中的历史数据, 不写入/不统计/不显示
+#   - 过车欠车: 已被 "过车" + "欠车" 两个新字段取代(历史值不迁移)
+#   - 滚道对称点过大: 与 "对称度超差" 语义重复, 只保留后者
+LEGACY_DEFECT_COLUMNS = ["过车欠车", "滚道对称点过大"]
 
 ALL_COLUMNS = BASE_COLUMNS + DEFECT_COLUMNS
 
 # 界面显示名 <-> 数据库列名 的映射 (新5字段无斜杠, 显示名=数据库名, 无需映射)
-_DISPLAY_TO_DB = {"磕伤/卡伤": "磕伤卡伤", "过车/欠车": "过车欠车"}
-_DB_TO_DISPLAY = {"磕伤卡伤": "磕伤/卡伤", "过车欠车": "过车/欠车"}
+# ★ 显示名 <-> 数据库列名 映射
+#   - 磕伤/卡伤: 数据库列名不带斜杠
+#   - 平行度超差: 界面显示"平行度超差", 数据库列名仍是"幅高椭圆"
+#     (历史"幅高椭圆"数据读取后自动以"平行度超差"呈现, 统计连续性不受影响)
+_DISPLAY_TO_DB = {"磕伤/卡伤": "磕伤卡伤", "平行度超差": "幅高椭圆"}
+_DB_TO_DISPLAY = {"磕伤卡伤": "磕伤/卡伤", "幅高椭圆": "平行度超差"}
 
 # 界面显示名 (load_all_records 返回的列名, 带斜杠的带斜杠, 新5字段不带斜杠)
-DEFECT_FIELDS_DISPLAY = ["锻造缺陷", "磕伤/卡伤", "接刀痕", "过车/欠车", "油沟", "倒角", "漏黑",
-                         "椭圆超差", "内径垫伤", "滚道对称点过大", "对称度超差", "幅高椭圆"]
+# ★ 界面显示名(12类): load_all_records 返回的列名, 表单/图表/统计/月报统一使用
+DEFECT_FIELDS_DISPLAY = ["锻造缺陷", "磕伤/卡伤", "接刀痕", "过车", "欠车", "油沟", "倒角", "漏黑",
+                         "椭圆超差", "内径垫伤", "对称度超差", "平行度超差"]
 
 
 class _Result:
@@ -338,7 +351,9 @@ def _load_all_records_cached():
     df = pd.DataFrame(result.rows, columns=result.columns)
     df = df.rename(columns=_DB_TO_DISPLAY)
     # ★ 防御: 历史动态缺陷功能残留的 additional_defects 列不返回前端(数据库字段保留, 仅界面不显示)
-    df = df.drop(columns=["additional_defects"], errors="ignore")
+    # ★ 历史遗留缺陷列(过车欠车/滚道对称点过大)同样不返回前端:
+    #   数据库中的历史值保留不动, 但界面与统计不再显示、不再计入
+    df = df.drop(columns=["additional_defects"] + LEGACY_DEFECT_COLUMNS, errors="ignore")
     return df
 
 
@@ -363,7 +378,8 @@ def _load_recent_records_cached(limit=50):
     result = _execute("SELECT * FROM quality_records ORDER BY id DESC LIMIT ?", [limit])
     df = pd.DataFrame(result.rows, columns=result.columns)
     df = df.rename(columns=_DB_TO_DISPLAY)
-    df = df.drop(columns=["additional_defects"], errors="ignore")
+    # ★ 历史遗留缺陷列(过车欠车/滚道对称点过大)不返回前端(数据库历史值保留)
+    df = df.drop(columns=["additional_defects"] + LEGACY_DEFECT_COLUMNS, errors="ignore")
     # 总记录数单独COUNT(不拉全表); Turso的integer经_from_turso_value已转int
     cnt = _execute("SELECT COUNT(*) FROM quality_records")
     total = int(cnt.rows[0][0]) if cnt.rows else 0
